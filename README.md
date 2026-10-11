@@ -17,7 +17,7 @@ Display da scrivania che mostra **Formula 1 e calcio in tempo reale**, senza app
 - Live timing di prove, qualifiche e gara: posizioni, distacchi, intervalli, pit stop, ritiri, giro, bandiere, SC/VSC, messaggi della direzione gara
 - Frecce di sorpasso (posizioni guadagnate/perse)
 - Classifica piloti, costruttori e risultato dell'ultima gara
-- Mappa del circuito con le monoposto in movimento
+- Mappa del circuito (sagoma ufficiale MultiViewer) con la **posizione stimata** delle monoposto; tocca un pilota nell'elenco per mostrarlo o nasconderlo (pulsanti TUTTI / NESSUNO, scelta salvata)
 - Gomme di ogni pilota con colori ufficiali e giri percorsi
 
 **Calcio**
@@ -44,7 +44,10 @@ Display da scrivania che mostra **Formula 1 e calcio in tempo reale**, senza app
 |---|---|
 | Partite, risultati, classifica Serie A, dettaglio partita | ESPN (`site.api.espn.com`) |
 | Classifiche F1, ultima gara, calendario | Jolpica (`api.jolpi.ca`) |
-| Live timing F1, gomme, posizioni | `livetiming.formula1.com` (SignalR su WebSocket) |
+| Live timing F1, gomme, passaggi sul traguardo | `livetiming.formula1.com` (SignalR su WebSocket) |
+| Sagoma dei circuiti | MultiViewer (`api.multiviewer.app`), scaricata una volta e salvata in NVS |
+
+> Le coordinate GPS delle monoposto (`Position.z`) il live timing le invia solo agli abbonati F1 TV: la posizione sulla mappa è quindi stimata dall'ultimo passaggio sul traguardo e dall'ultimo tempo sul giro di ogni pilota.
 
 ## Arduino IDE
 

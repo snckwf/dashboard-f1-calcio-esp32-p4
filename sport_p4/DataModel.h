@@ -192,19 +192,25 @@ struct F1LivePilota {
     char     gomma;           /* S M H I W, '?' sconosciuta, 0 = nessun dato */
     uint8_t  giriGomma;
     bool     gommaNuova;
-    /* posizione in pista (Position.z), coordinate F1 in decimi di metro */
-    int16_t  x, y;
-    bool     inPista;
+    /* per stimare la posizione in pista: Position.z del live timing richiede
+     * un abbonamento F1 TV, quindi si usa l'ultimo passaggio sul traguardo   */
+    uint32_t passaggioMs;     /* millis() dell'ultimo passaggio, 0 = ignoto */
+    uint32_t giroMs;          /* ultimo tempo sul giro in ms                */
 };
 
-/* sagoma del circuito, costruita dal percorso di una monoposto e salvata in NVS */
+/* sagoma del circuito (MultiViewer), salvata in NVS: una per circuito.
+ * t[] = tempo di riferimento dal traguardo a quel punto (centesimi di s) o,
+ * se il circuito non lo fornisce, la distanza percorsa; tGiro = t[n-1].     */
 #define TRK_MAX 800
 struct Tracciato {
     uint16_t chiave;          /* Meeting.Circuit.Key                        */
     uint16_t n;
-    bool     completo;
+    bool     completo;        /* sagoma disponibile                         */
+    bool     tempiVeri;       /* t[] in centesimi di secondo                */
     int16_t  x[TRK_MAX];
     int16_t  y[TRK_MAX];
+    uint16_t t[TRK_MAX];
+    uint16_t tGiro;
     uint32_t versione;
 };
 
@@ -223,7 +229,6 @@ struct F1Live {
     uint8_t      n;
     F1LivePilota p[24];
     uint16_t     circuito;      /* Meeting.Circuit.Key */
-    uint32_t     posVersione;   /* cambia a ogni aggiornamento delle posizioni */
     uint32_t     versione;
     uint32_t     aggMs;
 };

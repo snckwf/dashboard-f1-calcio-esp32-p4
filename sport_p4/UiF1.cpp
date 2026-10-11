@@ -7,6 +7,7 @@
 #include "Ui.h"
 #include "BoardLvgl.h"
 #include "esp_heap_caps.h"
+#include <Preferences.h>
 
 lv_color_t uiColoreGomma(char g)
 {
@@ -507,11 +508,14 @@ static void aggiornaRis(bool forza)
 }
 
 /* ===========================================================================
- *  MAPPA: sagoma del circuito e monoposto in tempo reale
+ *  MAPPA: sagoma del circuito e posizione stimata delle monoposto
  *
- *  La sagoma non arriva dal live timing: la costruisce F1Live seguendo il
- *  percorso di una monoposto per un giro, poi la salva in NVS (una per
- *  circuito). Le posizioni delle auto arrivano 3-4 volte al secondo.
+ *  Le coordinate GPS delle auto (Position.z) il live timing le da' solo agli
+ *  abbonati F1 TV. Qui la posizione e' una STIMA: dall'ultimo passaggio sul
+ *  traguardo (NumberOfLaps) e dall'ultimo tempo sul giro si ricava la frazione
+ *  di giro percorsa, che si riporta sulla sagoma di MultiViewer usando i suoi
+ *  tempi di riferimento punto per punto. Chi non ha ancora un passaggio noto
+ *  viene piazzato dal distacco dal leader. Box, ritirati e fermi: nascosti.
  * ========================================================================= */
 #define MAPPA_X   UI_PAD
 #define MAPPA_Y   UI_PAD
@@ -522,53 +526,135 @@ static void aggiornaRis(bool forza)
 #define ELENCO_W  (UI_INNER_W - MAPPA_W - 8)
 #define ELENCO_RIGHE 22
 
-struct PuntoAuto { char tla[4]; char num[4]; uint32_t colore; int16_t x, y; bool inPista; uint8_t pos; char gomma; char gap[14]; };
+struct PuntoAuto {
+    char tla[4]; char num[4]; uint32_t colore; uint8_t pos; char gomma; uint8_t giriGomma; char gap[14];
+    uint32_t passaggioMs, giroMs; char gapLeader[14]; bool nascosta;
+};
 
 static lv_obj_t *s_mappaPagina = nullptr;
 static lv_obj_t *s_mappa       = nullptr;
 static lv_obj_t *s_linea       = nullptr;
+static lv_obj_t *s_traguardo   = nullptr;
 static lv_obj_t *s_mappaInfo   = nullptr;
 static lv_obj_t *s_dot[24]     = { nullptr };
 static lv_obj_t *s_dotLbl[24]  = { nullptr };
 static lv_obj_t *s_elTit       = nullptr;
-struct RigaElenco { lv_obj_t *pos, *bar, *tla, *gomma, *gap; };
+struct RigaElenco { lv_obj_t *pos, *bar, *tla, *gomma, *gap, *tocco; };
 static RigaElenco s_el[ELENCO_RIGHE];
 
 static lv_point_precise_t s_pts[TRK_MAX + 1];
 static int16_t   *s_tx = nullptr, *s_ty = nullptr;    /* copia della sagoma */
-static uint16_t   s_tn = 0;
-static bool       s_tCompleta = false;
+static uint16_t  *s_tt = nullptr;
+static uint16_t   s_tn = 0, s_tGiro = 1;
+static bool       s_tCompleta = false, s_tTempi = false;
 static uint32_t   s_trkVer = 0xFFFFFFFF;
-static uint32_t   s_posVer = 0xFFFFFFFF;
 static uint32_t   s_mapLiveVer = 0xFFFFFFFF;
 static PuntoAuto  s_auto[24];
 static uint8_t    s_nAuto = 0;
-/* limiti in coordinate F1: dalla sagoma, allargati dalle posizioni delle auto */
+static bool       s_sessioneAttiva = false, s_gara = false;
+static char       s_sessione[80] = "";
 static int32_t    s_minX = 0, s_maxX = 0, s_minY = 0, s_maxY = 0;
-static bool       s_limiti = false;
 
-static void allargaLimiti(int32_t x, int32_t y)
+/* piloti nascosti sulla mappa: un bit per numero di gara (0..127), in NVS.
+ * Si sceglie toccando la riga del pilota nell'elenco a destra.             */
+static uint8_t s_nascosti[16];
+
+static bool pilotaNascosto(const char *num)
 {
-    if (!s_limiti) { s_minX = s_maxX = x; s_minY = s_maxY = y; s_limiti = true; return; }
-    if (x < s_minX) s_minX = x;
-    if (x > s_maxX) s_maxX = x;
-    if (y < s_minY) s_minY = y;
-    if (y > s_maxY) s_maxY = y;
+    const int n = atoi(num);
+    return n > 0 && n < 128 && (s_nascosti[n >> 3] & (1u << (n & 7))) != 0;
 }
 
-/* coordinate F1 -> pixel nella mappa (Y verso l'alto nei dati, verso il basso a schermo) */
+static void salvaNascosti()
+{
+    Preferences p;
+    if (p.begin("sport_p4", false)) { p.putBytes("f1nascosti", s_nascosti, sizeof(s_nascosti)); p.end(); }
+}
+
+static void caricaNascosti()
+{
+    memset(s_nascosti, 0, sizeof(s_nascosti));
+    Preferences p;
+    if (p.begin("sport_p4", true)) {
+        if (p.isKey("f1nascosti")) p.getBytes("f1nascosti", s_nascosti, sizeof(s_nascosti));
+        p.end();
+    }
+}
+
+static void aggiornaMappa(bool forza);
+
+static void rigaPilotaCb(lv_event_t *e)
+{
+    const uint32_t r = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    if (r >= s_nAuto) return;
+    const int n = atoi(s_auto[r].num);
+    if (n <= 0 || n >= 128) return;
+    s_nascosti[n >> 3] ^= (uint8_t)(1u << (n & 7));
+    salvaNascosti();
+    aggiornaMappa(true);
+}
+
+static void tuttiCb(lv_event_t *e)
+{
+    const bool nessuno = (uintptr_t)lv_event_get_user_data(e) != 0;
+    if (nessuno) {
+        for (uint8_t i = 0; i < s_nAuto; ++i) {
+            const int n = atoi(s_auto[i].num);
+            if (n > 0 && n < 128) s_nascosti[n >> 3] |= (uint8_t)(1u << (n & 7));
+        }
+    } else {
+        memset(s_nascosti, 0, sizeof(s_nascosti));
+    }
+    salvaNascosti();
+    aggiornaMappa(true);
+}
+
+static lv_obj_t *bottoncino(lv_obj_t *parent, lv_coord_t x, lv_coord_t w, const char *txt, bool nessuno)
+{
+    lv_obj_t *b = uiBox(parent, x, 0, w, 22, C_CARD2);
+    lv_obj_set_style_radius(b, 4, 0);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(b, 6);
+    lv_obj_t *l = uiLabel(b, txt, &lv_font_montserrat_12, C_TEXT);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, tuttiCb, LV_EVENT_CLICKED, (void *)(uintptr_t)(nessuno ? 1 : 0));
+    return b;
+}
+
+/* coordinate del circuito -> pixel nella mappa (Y verso l'alto nei dati) */
 static void proietta(int32_t x, int32_t y, int32_t *px, int32_t *py)
 {
     const float w = (float)(s_maxX - s_minX), h = (float)(s_maxY - s_minY);
     const float areaW = MAPPA_W - 2 * MAPPA_MARGINE, areaH = MAPPA_H - 2 * MAPPA_MARGINE;
     float k = 1.0f;
     if (w > 0 && h > 0) k = fminf(areaW / w, areaH / h);
-    else if (w > 0)     k = areaW / w;
-    else if (h > 0)     k = areaH / h;
     const float offX = MAPPA_MARGINE + (areaW - w * k) / 2.0f;
     const float offY = MAPPA_MARGINE + (areaH - h * k) / 2.0f;
     *px = (int32_t)(offX + (x - s_minX) * k);
     *py = (int32_t)(offY + (s_maxY - y) * k);
+}
+
+/* frazione di giro 0..1 -> punto sulla sagoma (interpolato) */
+static void puntoSulGiro(float f, int32_t *x, int32_t *y)
+{
+    const float target = f * (float)s_tGiro;
+    uint16_t lo = 0, hi = s_tn - 1;
+    while (hi - lo > 1) {
+        const uint16_t m = (lo + hi) / 2;
+        if ((float)s_tt[m] <= target) lo = m; else hi = m;
+    }
+    const float t0 = s_tt[lo], t1 = s_tt[hi];
+    const float a = t1 > t0 ? fminf(fmaxf((target - t0) / (t1 - t0), 0.0f), 1.0f) : 0.0f;
+    *x = (int32_t)(s_tx[lo] + (s_tx[hi] - s_tx[lo]) * a);
+    *y = (int32_t)(s_ty[lo] + (s_ty[hi] - s_ty[lo]) * a);
+}
+
+/* "+12.345" -> 12345 ms; 0 se non e' un distacco in secondi (es. "1L") */
+static uint32_t distaccoMs(const char *g)
+{
+    if (g == nullptr || g[0] != '+') return 0;
+    if (strchr(g, 'L') != nullptr) return 0;
+    return (uint32_t)(atof(g + 1) * 1000.0f);
 }
 
 static void creaMappa(lv_obj_t *pg)
@@ -576,6 +662,7 @@ static void creaMappa(lv_obj_t *pg)
     s_mappaPagina = pg;
     s_tx = static_cast<int16_t *>(heap_caps_calloc(TRK_MAX, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     s_ty = static_cast<int16_t *>(heap_caps_calloc(TRK_MAX, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    s_tt = static_cast<uint16_t *>(heap_caps_calloc(TRK_MAX, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     s_mappa = uiCard(pg, MAPPA_X, MAPPA_Y, MAPPA_W, MAPPA_H);
     lv_obj_set_style_pad_all(s_mappa, 0, 0);
@@ -585,6 +672,11 @@ static void creaMappa(lv_obj_t *pg)
     lv_obj_set_style_line_width(s_linea, 7, 0);
     lv_obj_set_style_line_color(s_linea, lv_color_hex(0x3A4250), 0);
     lv_obj_set_style_line_rounded(s_linea, true, 0);
+
+    /* traguardo: tacca bianca sul primo punto */
+    s_traguardo = uiBox(s_mappa, 0, 0, 12, 12, C_TEXT);
+    lv_obj_set_style_radius(s_traguardo, 2, 0);
+    lv_obj_add_flag(s_traguardo, LV_OBJ_FLAG_HIDDEN);
 
     for (uint8_t i = 0; i < 24; ++i) {
         lv_obj_t *d = uiBox(s_mappa, 0, 0, 14, 14, C_MUTED);
@@ -600,93 +692,142 @@ static void creaMappa(lv_obj_t *pg)
 
     s_mappaInfo = uiCol(s_mappa, 12, 8, MAPPA_W - 24, &lv_font_montserrat_14, C_MUTED, LV_TEXT_ALIGN_LEFT);
 
+    caricaNascosti();
     lv_obj_t *el = uiCard(pg, ELENCO_X, MAPPA_Y, ELENCO_W, MAPPA_H);
-    s_elTit = uiCol(el, 0, 0, ELENCO_W - 16, &lv_font_montserrat_14, C_MUTED, LV_TEXT_ALIGN_LEFT);
+    s_elTit = uiCol(el, 0, 3, 120, &lv_font_montserrat_12, C_MUTED, LV_TEXT_ALIGN_LEFT);
+    bottoncino(el, ELENCO_W - 16 - 152, 64, "TUTTI", false);
+    bottoncino(el, ELENCO_W - 16 - 82, 82, "NESSUNO", true);
     for (uint8_t r = 0; r < ELENCO_RIGHE; ++r) {
         RigaElenco &R = s_el[r];
-        const lv_coord_t y = 22 + r * 19;
+        const lv_coord_t y = 28 + r * 18;
         R.pos   = uiCol(el, 0,   y, 24, &lv_font_montserrat_14, C_TEXT,  LV_TEXT_ALIGN_RIGHT);
         R.bar   = uiBox(el, 30,  y + 2, 4, 14, C_MUTED);
         R.tla   = uiCol(el, 40,  y, 50, &lv_font_montserrat_14, C_TEXT,  LV_TEXT_ALIGN_LEFT);
         R.gomma = uiCol(el, 92,  y, 40, &lv_font_montserrat_14, C_MUTED, LV_TEXT_ALIGN_LEFT);
         R.gap   = uiCol(el, 132, y, ELENCO_W - 16 - 132, &lv_font_montserrat_14, C_MUTED, LV_TEXT_ALIGN_RIGHT);
         lv_obj_add_flag(R.bar, LV_OBJ_FLAG_HIDDEN);
+        /* zona trasparente sopra la riga: tocco = mostra/nascondi sulla mappa */
+        R.tocco = lv_obj_create(el);
+        lv_obj_remove_style_all(R.tocco);
+        lv_obj_set_pos(R.tocco, 0, y - 1);
+        lv_obj_set_size(R.tocco, ELENCO_W - 16, 18);
+        lv_obj_add_flag(R.tocco, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(R.tocco, rigaPilotaCb, LV_EVENT_CLICKED, (void *)(uintptr_t)r);
     }
 }
 
 static void aggiornaMappa(bool forza)
 {
-    if (s_tx == nullptr || s_ty == nullptr) return;
-    bool nuovaSagoma = false, nuovePos = false;
-    char sessione[80] = "";
-    bool gara = false;
+    if (s_tx == nullptr || s_ty == nullptr || s_tt == nullptr) return;
+    bool nuovaSagoma = false, nuoviDati = false;
     if (!dataLock(30)) return;
     if (forza || g_trk->versione != s_trkVer) {
-        s_tn = g_trk->n;
-        s_tCompleta = g_trk->completo;
+        s_tn = g_trk->completo ? g_trk->n : 0;
+        s_tCompleta = g_trk->completo && s_tn > 2;
+        s_tTempi = g_trk->tempiVeri;
+        s_tGiro = g_trk->tGiro ? g_trk->tGiro : 1;
         memcpy(s_tx, g_trk->x, s_tn * sizeof(int16_t));
         memcpy(s_ty, g_trk->y, s_tn * sizeof(int16_t));
+        memcpy(s_tt, g_trk->t, s_tn * sizeof(uint16_t));
         s_trkVer = g_trk->versione;
         nuovaSagoma = true;
     }
-    if (forza || nuovaSagoma || g_f1live->posVersione != s_posVer || g_f1live->versione != s_mapLiveVer) {
+    if (forza || nuovaSagoma || g_f1live->versione != s_mapLiveVer) {
         const F1Live &L = *g_f1live;
+        s_gara = strcmp(L.tipo, "Race") == 0;
+        s_sessioneAttiva = L.connesso && strcmp(L.stato, "Started") == 0;
         s_nAuto = L.n;
         for (uint8_t i = 0; i < L.n; ++i) {
             PuntoAuto &a = s_auto[i];
-            memcpy(a.tla, L.p[i].tla, sizeof(a.tla));
-            memcpy(a.num, L.p[i].num, sizeof(a.num));
-            a.colore = L.p[i].colore;
-            a.x = L.p[i].x; a.y = L.p[i].y;
-            a.inPista = L.p[i].inPista;
-            a.pos = L.p[i].pos;
-            a.gomma = L.p[i].gomma;
-            gara = strcmp(L.tipo, "Race") == 0;
-            if (gara) snprintf(a.gap, sizeof(a.gap), "%s", L.p[i].pos == 1 ? "LEADER" : L.p[i].intervallo);
-            else      snprintf(a.gap, sizeof(a.gap), "%s", L.p[i].migliore);
+            const F1LivePilota &p = L.p[i];
+            memcpy(a.tla, p.tla, sizeof(a.tla));
+            memcpy(a.num, p.num, sizeof(a.num));
+            a.colore = p.colore;
+            a.giriGomma = p.giriGomma;
+            a.pos = p.pos;
+            a.gomma = p.gomma;
+            a.passaggioMs = p.passaggioMs;
+            a.giroMs = p.giroMs;
+            a.nascosta = p.inPit || p.ritirato || p.fermo || pilotaNascosto(p.num);
+            snprintf(a.gapLeader, sizeof(a.gapLeader), "%s", p.gap);
+            if (s_gara) snprintf(a.gap, sizeof(a.gap), "%s", p.pos == 1 ? "LEADER" : p.intervallo);
+            else        snprintf(a.gap, sizeof(a.gap), "%s", p.migliore);
         }
-        if (L.meeting[0]) snprintf(sessione, sizeof(sessione), "%s - %s", L.meeting, L.sessione);
-        s_posVer = L.posVersione;
+        if (L.meeting[0]) snprintf(s_sessione, sizeof(s_sessione), "%s - %s", L.meeting, L.sessione);
+        else s_sessione[0] = 0;
         s_mapLiveVer = L.versione;
-        nuovePos = true;
+        nuoviDati = true;
     }
     dataUnlock();
-    if (!nuovaSagoma && !nuovePos) return;
 
-    /* limiti: dalla sagoma se c'e', altrimenti dalle auto */
+    /* sagoma: limiti e linea, solo quando cambia */
     if (nuovaSagoma) {
-        s_limiti = false;
-        for (uint16_t i = 0; i < s_tn; ++i) allargaLimiti(s_tx[i], s_ty[i]);
-    }
-    for (uint8_t i = 0; i < s_nAuto; ++i) if (s_auto[i].inPista) allargaLimiti(s_auto[i].x, s_auto[i].y);
-
-    if (nuovaSagoma || nuovePos) {
-        uint16_t n = 0;
-        for (uint16_t i = 0; i < s_tn; ++i) {
-            int32_t px, py;
-            proietta(s_tx[i], s_ty[i], &px, &py);
-            s_pts[n].x = px;
-            s_pts[n].y = py;
-            n++;
+        if (s_tCompleta) {
+            s_minX = s_maxX = s_tx[0]; s_minY = s_maxY = s_ty[0];
+            for (uint16_t i = 1; i < s_tn; ++i) {
+                if (s_tx[i] < s_minX) s_minX = s_tx[i];
+                if (s_tx[i] > s_maxX) s_maxX = s_tx[i];
+                if (s_ty[i] < s_minY) s_minY = s_ty[i];
+                if (s_ty[i] > s_maxY) s_maxY = s_ty[i];
+            }
+            uint16_t n = 0;
+            for (uint16_t i = 0; i < s_tn; ++i) {
+                int32_t px, py;
+                proietta(s_tx[i], s_ty[i], &px, &py);
+                s_pts[n].x = px; s_pts[n].y = py; n++;
+            }
+            s_pts[n++] = s_pts[0];                         /* chiude il giro */
+            lv_line_set_points(s_linea, s_pts, n);
+            lv_obj_remove_flag(s_linea, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(s_traguardo, (int32_t)s_pts[0].x - 6, (int32_t)s_pts[0].y - 6);
+            lv_obj_remove_flag(s_traguardo, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_linea, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_traguardo, LV_OBJ_FLAG_HIDDEN);
         }
-        if (s_tCompleta && n > 2) s_pts[n++] = s_pts[0];        /* chiude il giro */
-        lv_line_set_points(s_linea, s_pts, n);
     }
 
-    char buf[96];
-    if (!s_limiti) snprintf(buf, sizeof(buf), "%s", "Nessuna posizione: la mappa si attiva durante le sessioni");
-    else if (!s_tCompleta) snprintf(buf, sizeof(buf), "Sagoma del circuito in costruzione (%u punti): si completa dopo un giro", s_tn);
-    else snprintf(buf, sizeof(buf), "%s", sessione);
-    uiSetText(s_mappaInfo, buf);
-
+    /* posizioni stimate: ricalcolate a ogni giro del timer (si muovono col tempo) */
+    const uint32_t ora = millis();
+    const uint32_t rifMs = s_tTempi ? (uint32_t)s_tGiro * 10 : 0;
+    /* tempo trascorso dal passaggio del leader: base per chi non ha un passaggio noto */
+    int64_t eLeader = -1;
+    uint32_t giroLeader = 0;
+    if (s_nAuto > 0 && s_auto[0].passaggioMs != 0) {
+        eLeader = (int64_t)(ora - s_auto[0].passaggioMs);
+        giroLeader = s_auto[0].giroMs;
+    }
+    uint8_t visibili = 0;
     for (uint8_t i = 0; i < 24; ++i) {
-        if (i >= s_nAuto || !s_auto[i].inPista || !s_limiti) {
+        bool mostra = false;
+        int32_t px = 0, py = 0;
+        if (i < s_nAuto && s_tCompleta && s_sessioneAttiva && !s_auto[i].nascosta) {
+            const PuntoAuto &a = s_auto[i];
+            /* durata del giro attesa: l'ultimo giro dell'auto, se plausibile */
+            uint32_t giro = a.giroMs ? a.giroMs : (giroLeader ? giroLeader : rifMs);
+            if (rifMs > 0 && (giro < rifMs * 8 / 10 || giro > rifMs * 2)) giro = rifMs;
+            int64_t e = -1;
+            if (a.passaggioMs != 0) {
+                e = (int64_t)(ora - a.passaggioMs);
+            } else if (s_gara && eLeader >= 0) {
+                const uint32_t d = i == 0 ? 0 : distaccoMs(a.gapLeader);
+                if (i == 0 || d > 0) { e = eLeader - (int64_t)d; while (e < 0 && giro > 0) e += giro; }
+            }
+            if (giro > 0 && e >= 0 && e < (int64_t)giro * 25 / 10) {
+                float f = (float)e / (float)giro;
+                if (f > 0.995f) f = 0.995f;                 /* aspetta il passaggio sul traguardo */
+                int32_t x, y;
+                puntoSulGiro(f, &x, &y);
+                proietta(x, y, &px, &py);
+                mostra = true;
+            }
+        }
+        if (!mostra) {
             lv_obj_add_flag(s_dot[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_dotLbl[i], LV_OBJ_FLAG_HIDDEN);
             continue;
         }
-        int32_t px, py;
-        proietta(s_auto[i].x, s_auto[i].y, &px, &py);
+        visibili++;
         lv_obj_set_pos(s_dot[i], px - 7, py - 7);
         lv_obj_set_style_bg_color(s_dot[i], lv_color_hex(s_auto[i].colore), 0);
         lv_obj_remove_flag(s_dot[i], LV_OBJ_FLAG_HIDDEN);
@@ -694,10 +835,17 @@ static void aggiornaMappa(bool forza)
         lv_obj_set_pos(s_dotLbl[i], px + 9, py - 18);
         lv_obj_remove_flag(s_dotLbl[i], LV_OBJ_FLAG_HIDDEN);
     }
-    /* il leader sopra tutti */
     if (s_nAuto > 0) { lv_obj_move_foreground(s_dot[0]); lv_obj_move_foreground(s_dotLbl[0]); }
 
-    uiSetText(s_elTit, gara ? "ORDINE  -  GOMMA  -  INTERVALLO" : "ORDINE  -  GOMMA  -  GIRO MIGLIORE");
+    char buf[128];
+    if (!s_tCompleta)             snprintf(buf, sizeof(buf), "%s", "Sagoma del circuito in arrivo (MultiViewer)...");
+    else if (!s_sessioneAttiva)   snprintf(buf, sizeof(buf), "%s%sNessuna sessione in corso", s_sessione, s_sessione[0] ? "   -   " : "");
+    else if (visibili == 0)       snprintf(buf, sizeof(buf), "%s   -   posizioni dal prossimo passaggio sul traguardo", s_sessione);
+    else                          snprintf(buf, sizeof(buf), "%s   -   posizioni stimate", s_sessione);
+    uiSetText(s_mappaInfo, buf);
+
+    if (!nuoviDati && !forza) return;
+    uiSetText(s_elTit, "TOCCA PER SCEGLIERE");
     for (uint8_t r = 0; r < ELENCO_RIGHE; ++r) {
         RigaElenco &R = s_el[r];
         if (r >= s_nAuto) {
@@ -714,10 +862,17 @@ static void aggiornaMappa(bool forza)
         if (a.gomma) { snprintf(buf, sizeof(buf), "%c", a.gomma); uiSetText(R.gomma, buf); uiSetColor(R.gomma, uiColoreGomma(a.gomma)); }
         else uiSetText(R.gomma, "");
         uiSetText(R.gap, a.gap);
+        /* pilota escluso dalla mappa: riga attenuata */
+        const lv_opa_t opa = pilotaNascosto(a.num) ? LV_OPA_30 : LV_OPA_COVER;
+        lv_obj_set_style_opa(R.pos, opa, 0);
+        lv_obj_set_style_opa(R.bar, opa, 0);
+        lv_obj_set_style_opa(R.tla, opa, 0);
+        lv_obj_set_style_opa(R.gomma, opa, 0);
+        lv_obj_set_style_opa(R.gap, opa, 0);
     }
 }
 
-/* la mappa si muove piu' spesso del giro di aggiornamento da 1 s della UI */
+/* le auto si muovono di continuo: ridisegno ogni 300 ms con la pagina visibile */
 static void timerMappa(lv_timer_t *t)
 {
     (void)t;

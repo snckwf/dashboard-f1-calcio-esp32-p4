@@ -28,7 +28,6 @@
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "mbedtls/base64.h"
-#include "miniz.h"            /* tinfl in ROM: Position.z e' compresso con deflate */
 #include <Preferences.h>
 
 static const char HOST[] = "livetiming.formula1.com";
@@ -36,7 +35,7 @@ static const char TOPIC_SUBSCRIBE[] =
     "{\"type\":1,\"target\":\"Subscribe\",\"invocationId\":\"0\",\"arguments\":[["
     "\"SessionInfo\",\"SessionStatus\",\"LapCount\",\"TrackStatus\","
     "\"DriverList\",\"TimingData\",\"RaceControlMessages\","
-    "\"TimingAppData\",\"Position.z\"]]}\x1e";
+    "\"TimingAppData\"]]}\x1e";
 
 static constexpr size_t MSG_CAP = 512 * 1024;
 
@@ -49,14 +48,10 @@ static char     s_cookie[512];
 static char     s_token[128];
 static char     s_leader[4] = "";
 
-/* sagoma del circuito: caricamento/salvataggio in NVS fatti dal task, fuori dal lock */
+/* sagoma del circuito: caricamento da NVS o da MultiViewer fatto dal task,
+ * fuori dal lock dei dati */
 static volatile uint16_t s_trkDaCaricare = 0;
-static volatile bool     s_trkDaSalvare  = false;
-static char              s_rifNum[4]     = "";     /* monoposto che "disegna" la pista */
-static uint8_t          *s_b64   = nullptr;        /* buffer base64 decodificato  */
-static char             *s_infl  = nullptr;        /* buffer JSON decompresso     */
-static constexpr size_t  B64_CAP  = 16 * 1024;
-static constexpr size_t  INFL_CAP = 64 * 1024;
+static uint32_t          s_trkRiprovaMs  = 0;
 
 /* ===========================================================================
  *  Socket: lettura con timeout
@@ -545,8 +540,17 @@ static void applicaTiming(F1Live &L, JsonObject o, bool snapshot)
 
         copiaValore(d["GapToLeader"], p->gap, sizeof(p->gap));
         copiaValore(d["IntervalToPositionAhead"], p->intervallo, sizeof(p->intervallo));
-        copiaValore(d["LastLapTime"], p->ultimo, sizeof(p->ultimo));
-        if (!d["NumberOfLaps"].isNull())     p->giri  = (uint8_t)(d["NumberOfLaps"] | 0);
+        if (!d["LastLapTime"].isNull()) {
+            copiaValore(d["LastLapTime"], p->ultimo, sizeof(p->ultimo));
+            const uint32_t ms = tempoGiroMs(p->ultimo);
+            if (ms > 0) p->giroMs = ms;
+        }
+        if (!d["NumberOfLaps"].isNull()) {
+            const uint8_t g = (uint8_t)(d["NumberOfLaps"] | 0);
+            /* un giro in piu' = passaggio sul traguardo adesso */
+            if (!snapshot && g > p->giri) p->passaggioMs = millis() | 1;
+            p->giri = g;
+        }
         if (!d["NumberOfPitStops"].isNull()) p->pit   = (uint8_t)(d["NumberOfPitStops"] | 0);
         if (!d["InPit"].isNull())            p->inPit = d["InPit"] | false;
         if (!d["Retired"].isNull())          p->ritirato = d["Retired"] | false;
@@ -668,125 +672,130 @@ static void applicaGomme(F1Live &L, JsonObject o)
     }
 }
 
-/* ---- posizioni in pista (Position.z: base64 di un JSON compresso deflate) -- */
-static void aggiungiPuntoPista(int16_t x, int16_t y)
+/* ---- sagoma del circuito ---------------------------------------------------
+ * Fonte: MultiViewer (api.multiviewer.app), la stessa usata dall'omonima app
+ * per il live timing. Restituisce x[], y[] e, per molti circuiti, il tempo di
+ * riferimento dal traguardo a ogni punto (trackPositionTime): serve a piazzare
+ * le auto sulla pista partendo dal loro ultimo passaggio sul traguardo.
+ * Salvata in NVS (namespace "sport_trk2", chiave "c<circuito>"):
+ * blob = n, tempiVeri, tGiro, x[n], y[n], t[n] (tutti a 16 bit).            */
+static bool caricaDaNvs(uint16_t chiave, Tracciato &T)
 {
-    Tracciato &T = *g_trk;
-    if (T.completo || T.chiave == 0) return;
-    if (T.n > 0) {
-        const int32_t dx = x - T.x[T.n - 1], dy = y - T.y[T.n - 1];
-        const int32_t d2 = dx * dx + dy * dy;
-        if (d2 > 3000 * 3000) { T.n = 0; return; }           /* salto: ricomincia */
-        if (d2 < 120 * 120) return;                           /* troppo vicino   */
-        if (T.n > 150) {
-            const int32_t ex = x - T.x[0], ey = y - T.y[0];
-            if (ex * ex + ey * ey < 300 * 300) {               /* giro chiuso      */
-                T.completo = true;
-                T.versione++;
-                s_trkDaSalvare = true;
-                Serial.printf("[F1LIVE] sagoma del circuito %u completata: %u punti\n", T.chiave, T.n);
-                return;
-            }
-        }
-    }
-    T.x[T.n] = x;
-    T.y[T.n] = y;
-    T.n++;
-    T.versione++;
-    if (T.n >= TRK_MAX) { T.completo = true; s_trkDaSalvare = true; }
-}
-
-static void applicaPosizioni(F1Live &L, const char *b64)
-{
-    if (b64 == nullptr || s_b64 == nullptr || s_infl == nullptr) return;
-    size_t nb = 0;
-    if (mbedtls_base64_decode(s_b64, B64_CAP, &nb, reinterpret_cast<const unsigned char *>(b64), strlen(b64)) != 0) return;
-    const size_t ni = tinfl_decompress_mem_to_mem(s_infl, INFL_CAP - 1, s_b64, nb, 0);
-    if (ni == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED || ni == 0) return;
-    s_infl[ni] = 0;
-
-    JsonDocument doc(PSRAM_JSON);
-    if (deserializeJson(doc, s_infl, ni)) return;
-    JsonArray campioni = doc["Position"];
-    if (campioni.isNull() || campioni.size() == 0) return;
-
-    /* la monoposto di riferimento per la sagoma: il leader, se e' in pista */
-    if (s_rifNum[0] == 0 && L.n > 0) snprintf(s_rifNum, sizeof(s_rifNum), "%s", L.p[0].num);
-
-    for (JsonObject c : campioni) {
-        JsonObject e = c["Entries"];
-        if (s_rifNum[0] != 0 && !g_trk->completo) {
-            JsonObject r = e[s_rifNum];
-            if (!r.isNull() && strcmp(r["Status"] | "", "OnTrack") == 0) {
-                const int16_t x = (int16_t)(r["X"] | 0), y = (int16_t)(r["Y"] | 0);
-                if (x != 0 || y != 0) aggiungiPuntoPista(x, y);
-            }
-        }
-    }
-    /* per lo schermo basta l'ultimo campione */
-    JsonObject ultimo = campioni[campioni.size() - 1]["Entries"];
-    for (JsonPair kv : ultimo) {
-        F1LivePilota *p = pilota(L, kv.key().c_str(), false);
-        if (p == nullptr) continue;
-        JsonObject e = kv.value();
-        p->x = (int16_t)(e["X"] | 0);
-        p->y = (int16_t)(e["Y"] | 0);
-        p->inPista = strcmp(e["Status"] | "", "OnTrack") == 0 && (p->x != 0 || p->y != 0);
-    }
-    L.posVersione++;
-}
-
-/* NVS: una chiave per circuito, blob = n (uint16) + x[n] + y[n] */
-static void caricaTracciato(uint16_t chiave)
-{
+    static int16_t buf[3 + 3 * TRK_MAX];
     char k[12];
     snprintf(k, sizeof(k), "c%u", chiave);
-    static int16_t buf[1 + 2 * TRK_MAX];
     size_t letti = 0;
     Preferences p;
-    if (p.begin("sport_trk", true)) {
-        letti = p.getBytes(k, buf, sizeof(buf));
+    if (p.begin("sport_trk2", true)) {
+        if (p.isKey(k)) letti = p.getBytes(k, buf, sizeof(buf));
         p.end();
     }
-    if (dataLock(1000)) {
-        Tracciato &T = *g_trk;
-        const uint32_t ver = T.versione;
-        memset(&T, 0, sizeof(T));
-        T.versione = ver;
-        T.chiave = chiave;
-        const uint16_t n = letti >= 2 ? (uint16_t)buf[0] : 0;
-        if (n > 0 && n <= TRK_MAX && letti >= (size_t)(1 + 2 * n) * 2) {
-            memcpy(T.x, buf + 1, n * 2);
-            memcpy(T.y, buf + 1 + n, n * 2);
-            T.n = n;
-            T.completo = true;
-        }
-        T.versione++;
-        s_rifNum[0] = 0;
-        dataUnlock();
-        Serial.printf("[F1LIVE] circuito %u: sagoma %s (%u punti)\n", chiave, T.completo ? "caricata da NVS" : "da costruire", T.n);
+    if (letti < 6) return false;
+    const uint16_t n = (uint16_t)buf[0];
+    if (n < 10 || n > TRK_MAX || letti < (size_t)(3 + 3 * n) * 2) return false;
+    T.n = n;
+    T.tempiVeri = buf[1] != 0;
+    T.tGiro = (uint16_t)buf[2];
+    memcpy(T.x, buf + 3, n * 2);
+    memcpy(T.y, buf + 3 + n, n * 2);
+    memcpy(T.t, buf + 3 + 2 * n, n * 2);
+    T.completo = true;
+    return true;
+}
+
+static void salvaInNvs(const Tracciato &T)
+{
+    static int16_t buf[3 + 3 * TRK_MAX];
+    const uint16_t n = T.n;
+    buf[0] = (int16_t)n;
+    buf[1] = T.tempiVeri ? 1 : 0;
+    buf[2] = (int16_t)T.tGiro;
+    memcpy(buf + 3, T.x, n * 2);
+    memcpy(buf + 3 + n, T.y, n * 2);
+    memcpy(buf + 3 + 2 * n, T.t, n * 2);
+    char k[12];
+    snprintf(k, sizeof(k), "c%u", T.chiave);
+    Preferences p;
+    if (p.begin("sport_trk2", false)) {
+        p.putBytes(k, buf, (size_t)(3 + 3 * n) * 2);
+        p.end();
     }
 }
 
-static void salvaTracciato()
+/* scarica la sagoma; true se riuscito */
+static bool scaricaDaMultiViewer(uint16_t chiave, Tracciato &T)
 {
-    static int16_t buf[1 + 2 * TRK_MAX];
-    uint16_t chiave = 0, n = 0;
-    if (!dataLock(1000)) return;
-    chiave = g_trk->chiave;
-    n = g_trk->n;
-    buf[0] = (int16_t)n;
-    memcpy(buf + 1, g_trk->x, n * 2);
-    memcpy(buf + 1 + n, g_trk->y, n * 2);
-    dataUnlock();
-    if (chiave == 0 || n == 0) return;
-    char k[12];
-    snprintf(k, sizeof(k), "c%u", chiave);
-    Preferences p;
-    if (p.begin("sport_trk", false)) {
-        p.putBytes(k, buf, (size_t)(1 + 2 * n) * 2);
-        p.end();
-        Serial.printf("[F1LIVE] sagoma del circuito %u salvata in NVS\n", chiave);
+    time_t ora = time(nullptr);
+    struct tm tmv;
+    localtime_r(&ora, &tmv);
+    int anno = tmv.tm_year + 1900;
+    if (anno < 2024) anno = 2026;
+    for (int prova = 0; prova < 3; ++prova, --anno) {
+        char url[96];
+        snprintf(url, sizeof(url), "https://api.multiviewer.app/api/v1/circuits/%u/%d", chiave, anno);
+        String body;
+        const int code = httpGet(url, body);
+        if (code != 200) continue;
+        JsonDocument filtro;
+        filtro["x"] = true;
+        filtro["y"] = true;
+        filtro["trackPositionTime"] = true;
+        filtro["circuitName"] = true;
+        JsonDocument doc(PSRAM_JSON);
+        if (deserializeJson(doc, body, DeserializationOption::Filter(filtro))) continue;
+        body = String();
+        JsonArray ax = doc["x"], ay = doc["y"], at = doc["trackPositionTime"];
+        const size_t tot = ax.size();
+        if (tot < 10 || ay.size() != tot) continue;
+        const bool tempi = at.size() == tot;
+        const size_t passo = (tot + TRK_MAX - 1) / TRK_MAX;     /* sfoltisce oltre 800 punti */
+        uint16_t n = 0;
+        float dist = 0;
+        int32_t px = 0, py = 0;
+        for (size_t i = 0; i < tot && n < TRK_MAX; i += passo) {
+            const int32_t x = (int32_t)(ax[i] | 0.0f), y = (int32_t)(ay[i] | 0.0f);
+            if (n > 0) dist += sqrtf((float)(x - px) * (x - px) + (float)(y - py) * (y - py));
+            T.x[n] = (int16_t)constrain(x, -32000, 32000);
+            T.y[n] = (int16_t)constrain(y, -32000, 32000);
+            T.t[n] = tempi ? (uint16_t)lroundf((at[i] | 0.0f) * 100.0f) : (uint16_t)0;
+            if (!tempi) T.t[n] = (uint16_t)fminf(dist / 4.0f, 65000.0f);  /* distanza in 40 cm */
+            px = x; py = y;
+            n++;
+        }
+        T.n = n;
+        T.tempiVeri = tempi;
+        T.tGiro = T.t[n - 1];
+        if (T.tGiro == 0) T.tGiro = 1;
+        T.completo = true;
+        Serial.printf("[F1LIVE] sagoma %s (circuito %u, %d) da MultiViewer: %u punti%s\n",
+                      doc["circuitName"] | "?", chiave, anno, n, tempi ? ", con tempi" : "");
+        return true;
+    }
+    return false;
+}
+
+static void caricaTracciato(uint16_t chiave)
+{
+    static Tracciato tmp;           /* ~5 KB, fuori dallo stack del task */
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.chiave = chiave;
+    bool ok = caricaDaNvs(chiave, tmp);
+    if (ok) {
+        Serial.printf("[F1LIVE] circuito %u: sagoma caricata da NVS (%u punti)\n", chiave, tmp.n);
+    } else {
+        ok = scaricaDaMultiViewer(chiave, tmp);
+        if (ok) salvaInNvs(tmp);
+    }
+    if (!ok) {
+        Serial.printf("[F1LIVE] circuito %u: sagoma non disponibile, riprovo fra 10 min\n", chiave);
+        s_trkDaCaricare = chiave;
+        s_trkRiprovaMs = millis() | 1;
+        return;
+    }
+    if (dataLock(1000)) {
+        tmp.versione = g_trk->versione + 1;
+        memcpy(g_trk, &tmp, sizeof(Tracciato));
+        dataUnlock();
     }
 }
 
@@ -800,7 +809,6 @@ static void applica(const char *topic, JsonVariant v, bool snapshot)
     else if (strcmp(topic, "TimingData") == 0)      applicaTiming(L, v.as<JsonObject>(), snapshot);
     else if (strcmp(topic, "RaceControlMessages") == 0) applicaMessaggi(L, v);
     else if (strcmp(topic, "TimingAppData") == 0)   applicaGomme(L, v.as<JsonObject>());
-    else if (strcmp(topic, "Position.z") == 0)      applicaPosizioni(L, v.as<const char *>());
     else if (strcmp(topic, "LapCount") == 0) {
         if (!v["CurrentLap"].isNull()) L.giro    = (uint8_t)(v["CurrentLap"] | 0);
         if (!v["TotalLaps"].isNull())  L.giriTot = (uint8_t)(v["TotalLaps"] | 0);
@@ -835,7 +843,7 @@ static bool processa()
                         static const char *const ORDINE[] = {
                             "SessionInfo", "SessionStatus", "LapCount", "TrackStatus",
                             "DriverList", "TimingData", "RaceControlMessages",
-                            "TimingAppData", "Position.z",
+                            "TimingAppData",
                         };
                         for (const char *t : ORDINE) {
                             if (!res[t].isNull()) applica(t, res[t], true);
@@ -895,8 +903,6 @@ void f1LiveTask(void *arg)
         vTaskDelete(nullptr);
         return;
     }
-    s_b64  = static_cast<uint8_t *>(heap_caps_malloc(B64_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    s_infl = static_cast<char *>(heap_caps_malloc(INFL_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     uint32_t ultimoTentativo = 0;
     uint32_t attesa = 0;
@@ -912,6 +918,14 @@ void f1LiveTask(void *arg)
             if (s_connesso) chiudi();
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
+        }
+
+        /* sagoma del circuito (anche a sessione chiusa) */
+        if (s_trkDaCaricare != 0 && (s_trkRiprovaMs == 0 || millis() - s_trkRiprovaMs >= 600000)) {
+            const uint16_t k = s_trkDaCaricare;
+            s_trkDaCaricare = 0;
+            s_trkRiprovaMs = 0;
+            caricaTracciato(k);
         }
 
         if (!s_connesso) {
@@ -971,15 +985,6 @@ void f1LiveTask(void *arg)
             ultimoTentativo = millis();
             attesa = F1_LIVE_CONTROLLO_MS;
             continue;
-        }
-        if (s_trkDaCaricare != 0) {
-            const uint16_t k = s_trkDaCaricare;
-            s_trkDaCaricare = 0;
-            caricaTracciato(k);
-        }
-        if (s_trkDaSalvare) {
-            s_trkDaSalvare = false;
-            salvaTracciato();
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }

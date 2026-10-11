@@ -142,7 +142,7 @@ void setup()
     xTaskCreatePinnedToCore(wifiTask,   "wifi",   4096,  nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(calcioTask, "calcio", 16384, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(f1Task,     "f1",     12288, nullptr, 1, nullptr, 0);
-    /* 32 KB: la decompressione di Position.z usa ~11 KB di stack (tinfl in ROM) */
+    /* 32 KB: TLS del WebSocket + download HTTPS della sagoma del circuito */
     xTaskCreatePinnedToCore(f1LiveTask, "f1live", 32768, nullptr, 2, nullptr, 0);
     webBegin();
 }
