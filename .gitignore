@@ -1,0 +1,11 @@
+# credenziali locali
+secrets.h
+# build Arduino
+build/
+*.bin
+*.elf
+*.map
+# sistema
+.vscode/
+Thumbs.db
+desktop.ini
