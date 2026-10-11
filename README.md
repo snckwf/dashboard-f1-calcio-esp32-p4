@@ -73,6 +73,18 @@ La prima compilazione richiede circa 15 minuti.
 
 **Comandi seriale (115200 baud):** `d` prova suoni · `m` avvisi on/off · `g` simula gol · `f` simula avviso F1
 
+## Collegamenti elettrici
+
+La scheda **Waveshare ESP32-P4-WIFI6-Touch-LCD-7B** integra già display, touch, WiFi (ESP32-C6) e codec audio: non ci sono fili da saldare.
+
+| Collegamento | Dove |
+|---|---|
+| Altoparlante (in dotazione) | connettore **SPK / speaker** della scheda (uscita del codec ES8311) |
+| Alimentazione e programmazione | porta **USB-C** della scheda, alimentatore **5 V** (almeno 2 A) |
+
+- Collega lo speaker **prima** di chiudere il case: il cavetto passa dal corpo al vano del supporto.
+- Per caricare lo sketch usa un cavo USB-C dati (non solo ricarica).
+
 ## Case stampato in 3D
 
 File STL nella cartella [`case_3d`](case_3d):
