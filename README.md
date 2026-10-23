@@ -5,7 +5,7 @@
 >
 > Altri progetti di elettronica, Arduino, ESP32 e stampa 3D su **[www.emgi.it](https://www.emgi.it)**
 
-![Dashboard F1 e calcio](immagini/cover-2026-dashboard-formula-1-calcio-esp32-p4.png)
+![Dashboard F1 e calcio](immagini/copertina-3d.jpg)
 
 Display da scrivania che mostra **Formula 1 e calcio in tempo reale**, senza app, account o chiavi API, con **avvisi sonori** per gol, cambi di leader, Safety Car e bandiere. Firmware Arduino con LVGL 9, case stampato in 3D con supporto da tavolo e vano per lo speaker.
 
